@@ -71,7 +71,7 @@ Smoke test:
 Expected memory output includes:
 
 ```json
-{"tool":"memory_recall","backend":"manifest-stub","freshness":"unknown"}
+{"tool":"memory_recall","backend":"sqlite-manifest","freshness":"fresh"}
 ```
 
 ## Docker Helper

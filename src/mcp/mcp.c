@@ -4267,37 +4267,455 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
-/* ── Tool dispatch ────────────────────────────────────────────── */
+/* ── Agent memory manifest ─────────────────────────────────────── */
 
-static char *handle_memory_stub(const char *tool_name, const char *args_json) {
-    yyjson_doc *args_doc = args_json ? yyjson_read(args_json, strlen(args_json), 0) : NULL;
-    yyjson_val *args_root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
-    const char *project_key = "";
-    yyjson_val *pk = args_root ? yyjson_obj_get(args_root, "project_key") : NULL;
-    if (pk && yyjson_is_str(pk)) {
-        const char *value = yyjson_get_str(pk);
-        project_key = value ? value : "";
+static const char *memory_arg_str(yyjson_val *args, const char *key, const char *fallback) {
+    yyjson_val *val = args ? yyjson_obj_get(args, key) : NULL;
+    if (val && yyjson_is_str(val)) {
+        const char *s = yyjson_get_str(val);
+        return s ? s : fallback;
     }
+    return fallback;
+}
 
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root = yyjson_mut_obj(doc);
-    yyjson_mut_doc_set_root(doc, root);
-    yyjson_mut_obj_add_str(doc, root, "tool", tool_name ? tool_name : "memory");
-    yyjson_mut_obj_add_str(doc, root, "backend", "manifest-stub");
-    yyjson_mut_obj_add_str(doc, root, "status", "not_configured");
-    yyjson_mut_obj_add_str(doc, root, "project_key", project_key);
-    yyjson_mut_obj_add_str(doc, root, "freshness", "unknown");
-    yyjson_mut_obj_add_str(doc, root, "next", "wire native memory manifest and zvec adapter");
+static double memory_arg_real(yyjson_val *args, const char *key, double fallback) {
+    yyjson_val *val = args ? yyjson_obj_get(args, key) : NULL;
+    return val && yyjson_is_num(val) ? yyjson_get_real(val) : fallback;
+}
 
+static int memory_arg_int(yyjson_val *args, const char *key, int fallback) {
+    yyjson_val *val = args ? yyjson_obj_get(args, key) : NULL;
+    return val && yyjson_is_int(val) ? (int)yyjson_get_int(val) : fallback;
+}
+
+static bool memory_arg_bool(yyjson_val *args, const char *key, bool fallback) {
+    yyjson_val *val = args ? yyjson_obj_get(args, key) : NULL;
+    return val && yyjson_is_bool(val) ? yyjson_get_bool(val) : fallback;
+}
+
+static void memory_db_path(char *buf, size_t bufsz) {
+    char dir[CBM_SZ_1K];
+    cache_dir(dir, sizeof(dir));
+    (void)cbm_mkdir_p(dir, 0755);
+    snprintf(buf, bufsz, "%s/_memory.db", dir);
+}
+
+static int memory_open_db(sqlite3 **db) {
+    char path[CBM_SZ_1K];
+    memory_db_path(path, sizeof(path));
+    if (sqlite3_open(path, db) != SQLITE_OK) {
+        return -1;
+    }
+    const char *schema =
+        "PRAGMA journal_mode=WAL;"
+        "CREATE TABLE IF NOT EXISTS memory_candidates ("
+        "id TEXT PRIMARY KEY,"
+        "project_key TEXT NOT NULL,"
+        "scope TEXT,"
+        "kind TEXT,"
+        "text TEXT NOT NULL,"
+        "source TEXT,"
+        "source_ref TEXT,"
+        "source_hash TEXT,"
+        "confidence REAL DEFAULT 0,"
+        "importance REAL DEFAULT 0,"
+        "status TEXT NOT NULL DEFAULT 'pending',"
+        "validation_status TEXT,"
+        "created_at INTEGER NOT NULL,"
+        "validated_at INTEGER,"
+        "committed_at INTEGER"
+        ");"
+        "CREATE TABLE IF NOT EXISTS memories ("
+        "id TEXT PRIMARY KEY,"
+        "candidate_id TEXT,"
+        "project_key TEXT NOT NULL,"
+        "scope TEXT,"
+        "kind TEXT,"
+        "text TEXT NOT NULL,"
+        "source TEXT,"
+        "source_ref TEXT,"
+        "source_hash TEXT,"
+        "confidence REAL DEFAULT 0,"
+        "importance REAL DEFAULT 0,"
+        "freshness TEXT NOT NULL DEFAULT 'fresh',"
+        "created_at INTEGER NOT NULL,"
+        "validated_at INTEGER,"
+        "committed_at INTEGER NOT NULL,"
+        "last_used_at INTEGER"
+        ");"
+        "CREATE TABLE IF NOT EXISTS memory_feedback ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "memory_id TEXT NOT NULL,"
+        "outcome TEXT NOT NULL,"
+        "note TEXT,"
+        "created_at INTEGER NOT NULL"
+        ");";
+    char *err = NULL;
+    int rc = sqlite3_exec(*db, schema, NULL, NULL, &err);
+    if (err) {
+        sqlite3_free(err);
+    }
+    if (rc != SQLITE_OK) {
+        sqlite3_close(*db);
+        *db = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+static char *memory_result_doc(yyjson_mut_doc *doc) {
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
-    if (args_doc) {
-        yyjson_doc_free(args_doc);
-    }
     char *result = cbm_mcp_text_result(json ? json : "{}", false);
     free(json);
     return result;
 }
+
+static yyjson_mut_val *memory_base_doc(yyjson_mut_doc **out_doc, const char *tool_name,
+                                       const char *project_key) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "tool", tool_name ? tool_name : "memory");
+    yyjson_mut_obj_add_str(doc, root, "backend", "sqlite-manifest");
+    yyjson_mut_obj_add_str(doc, root, "project_key", project_key ? project_key : "global");
+    *out_doc = doc;
+    return root;
+}
+
+static char *memory_error_result(const char *tool_name, const char *project_key, const char *message) {
+    yyjson_mut_doc *doc = NULL;
+    yyjson_mut_val *root = memory_base_doc(&doc, tool_name, project_key);
+    yyjson_mut_obj_add_str(doc, root, "status", "error");
+    yyjson_mut_obj_add_str(doc, root, "error", message ? message : "memory error");
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    char *result = cbm_mcp_text_result(json ? json : "{}", true);
+    free(json);
+    return result;
+}
+
+static int memory_count_by_status(sqlite3 *db, const char *project_key, const char *status) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT COUNT(*) FROM memory_candidates WHERE project_key=?1 AND status=?2";
+    int count = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, project_key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, status, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            count = sqlite3_column_int(stmt, 0);
+        }
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+static int memory_count_table(sqlite3 *db, const char *project_key, const char *table) {
+    sqlite3_stmt *stmt = NULL;
+    char sql[160];
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*) FROM %s WHERE project_key=?1", table);
+    int count = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, project_key, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            count = sqlite3_column_int(stmt, 0);
+        }
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+static void memory_make_id(char *buf, size_t bufsz) {
+    static unsigned long counter = 0;
+    snprintf(buf, bufsz, "mem-%lld-%lu", (long long)time(NULL), ++counter);
+}
+
+static char *handle_memory_candidate(const char *tool_name, yyjson_val *args) {
+    const char *project_key = memory_arg_str(args, "project_key", "global");
+    const char *text = memory_arg_str(args, "text", NULL);
+    if (!text || !text[0]) {
+        return memory_error_result(tool_name, project_key, "memory_candidate requires text");
+    }
+    sqlite3 *db = NULL;
+    if (memory_open_db(&db) != 0) {
+        return memory_error_result(tool_name, project_key, "failed to open memory manifest");
+    }
+
+    char id[64];
+    memory_make_id(id, sizeof(id));
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "INSERT INTO memory_candidates "
+        "(id,project_key,scope,kind,text,source,source_ref,source_hash,confidence,importance,status,"
+        "created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'',?8,?9,'pending',?10)";
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, project_key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, memory_arg_str(args, "scope", "project"), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 4, memory_arg_str(args, "kind", "fact"), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 5, text, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 6, memory_arg_str(args, "source", ""), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 7, memory_arg_str(args, "source_ref", ""), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_double(stmt, 8, memory_arg_real(args, "confidence", 0.0));
+        sqlite3_bind_double(stmt, 9, memory_arg_real(args, "importance", 0.0));
+        sqlite3_bind_int64(stmt, 10, (sqlite3_int64)time(NULL));
+        rc = sqlite3_step(stmt);
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        sqlite3_close(db);
+        return memory_error_result(tool_name, project_key, "failed to record memory candidate");
+    }
+
+    yyjson_mut_doc *doc = NULL;
+    yyjson_mut_val *root = memory_base_doc(&doc, tool_name, project_key);
+    yyjson_mut_obj_add_str(doc, root, "status", "pending");
+    yyjson_mut_obj_add_strcpy(doc, root, "candidate_id", id);
+    yyjson_mut_obj_add_str(doc, root, "freshness", "uncommitted");
+    sqlite3_close(db);
+    return memory_result_doc(doc);
+}
+
+static char *handle_memory_validate(const char *tool_name, yyjson_val *args) {
+    const char *project_key = memory_arg_str(args, "project_key", "global");
+    bool dry_run = memory_arg_bool(args, "dry_run", true);
+    sqlite3 *db = NULL;
+    if (memory_open_db(&db) != 0) {
+        return memory_error_result(tool_name, project_key, "failed to open memory manifest");
+    }
+    int pending = memory_count_by_status(db, project_key, "pending");
+    int validated = pending;
+    if (!dry_run && pending > 0) {
+        sqlite3_stmt *stmt = NULL;
+        const char *sql =
+            "UPDATE memory_candidates SET status='validated', validation_status='valid', "
+            "validated_at=?1 WHERE project_key=?2 AND status='pending'";
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(stmt, 1, (sqlite3_int64)time(NULL));
+            sqlite3_bind_text(stmt, 2, project_key, -1, SQLITE_TRANSIENT);
+            (void)sqlite3_step(stmt);
+            validated = sqlite3_changes(db);
+        }
+        sqlite3_finalize(stmt);
+    }
+    yyjson_mut_doc *doc = NULL;
+    yyjson_mut_val *root = memory_base_doc(&doc, tool_name, project_key);
+    yyjson_mut_obj_add_str(doc, root, "status", "validated");
+    yyjson_mut_obj_add_bool(doc, root, "dry_run", dry_run);
+    yyjson_mut_obj_add_int(doc, root, "pending", pending);
+    yyjson_mut_obj_add_int(doc, root, "validated", validated);
+    yyjson_mut_obj_add_str(doc, root, "freshness", "verified");
+    sqlite3_close(db);
+    return memory_result_doc(doc);
+}
+
+static char *handle_memory_commit(const char *tool_name, yyjson_val *args) {
+    const char *project_key = memory_arg_str(args, "project_key", "global");
+    const char *id = memory_arg_str(args, "id", NULL);
+    bool dry_run = memory_arg_bool(args, "dry_run", false);
+    sqlite3 *db = NULL;
+    if (memory_open_db(&db) != 0) {
+        return memory_error_result(tool_name, project_key, "failed to open memory manifest");
+    }
+    int ready = memory_count_by_status(db, project_key, "validated");
+    int committed = 0;
+    if (!dry_run && ready > 0) {
+        sqlite3_stmt *stmt = NULL;
+        const char *sql =
+            "INSERT OR IGNORE INTO memories "
+            "(id,candidate_id,project_key,scope,kind,text,source,source_ref,source_hash,confidence,"
+            "importance,freshness,created_at,validated_at,committed_at) "
+            "SELECT id,id,project_key,scope,kind,text,source,source_ref,source_hash,confidence,"
+            "importance,'fresh',created_at,validated_at,?1 FROM memory_candidates "
+            "WHERE project_key=?2 AND status='validated' AND (?3 IS NULL OR id=?3)";
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(stmt, 1, (sqlite3_int64)time(NULL));
+            sqlite3_bind_text(stmt, 2, project_key, -1, SQLITE_TRANSIENT);
+            if (id) {
+                sqlite3_bind_text(stmt, 3, id, -1, SQLITE_TRANSIENT);
+            } else {
+                sqlite3_bind_null(stmt, 3);
+            }
+            (void)sqlite3_step(stmt);
+            committed = sqlite3_changes(db);
+        }
+        sqlite3_finalize(stmt);
+
+        if (committed > 0) {
+            const char *update_sql =
+                "UPDATE memory_candidates SET status='committed', committed_at=?1 "
+                "WHERE project_key=?2 AND status='validated' AND (?3 IS NULL OR id=?3)";
+            if (sqlite3_prepare_v2(db, update_sql, -1, &stmt, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(stmt, 1, (sqlite3_int64)time(NULL));
+                sqlite3_bind_text(stmt, 2, project_key, -1, SQLITE_TRANSIENT);
+                if (id) {
+                    sqlite3_bind_text(stmt, 3, id, -1, SQLITE_TRANSIENT);
+                } else {
+                    sqlite3_bind_null(stmt, 3);
+                }
+                (void)sqlite3_step(stmt);
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+    yyjson_mut_doc *doc = NULL;
+    yyjson_mut_val *root = memory_base_doc(&doc, tool_name, project_key);
+    yyjson_mut_obj_add_str(doc, root, "status", "committed");
+    yyjson_mut_obj_add_bool(doc, root, "dry_run", dry_run);
+    yyjson_mut_obj_add_int(doc, root, "ready", ready);
+    yyjson_mut_obj_add_int(doc, root, "committed", committed);
+    yyjson_mut_obj_add_str(doc, root, "freshness", "fresh");
+    sqlite3_close(db);
+    return memory_result_doc(doc);
+}
+
+static char *handle_memory_recall_search(const char *tool_name, yyjson_val *args) {
+    const char *project_key = memory_arg_str(args, "project_key", "global");
+    const char *query = memory_arg_str(args, "query", "");
+    int topk = memory_arg_int(args, "topk", 10);
+    if (topk <= 0 || topk > 100) {
+        topk = 10;
+    }
+    sqlite3 *db = NULL;
+    if (memory_open_db(&db) != 0) {
+        return memory_error_result(tool_name, project_key, "failed to open memory manifest");
+    }
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT id,scope,kind,text,source,source_ref,confidence,importance,freshness,committed_at "
+        "FROM memories WHERE project_key=?1 AND "
+        "(?2='' OR text LIKE '%'||?2||'%' OR kind LIKE '%'||?2||'%' OR scope LIKE '%'||?2||'%') "
+        "ORDER BY importance DESC, confidence DESC, committed_at DESC LIMIT ?3";
+    (void)sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+    if (stmt) {
+        sqlite3_bind_text(stmt, 1, project_key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, query, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 3, topk);
+    }
+
+    yyjson_mut_doc *doc = NULL;
+    yyjson_mut_val *root = memory_base_doc(&doc, tool_name, project_key);
+    yyjson_mut_obj_add_str(doc, root, "freshness", "fresh");
+    yyjson_mut_obj_add_strcpy(doc, root, "query", query);
+    yyjson_mut_val *items = yyjson_mut_arr(doc);
+    int count = 0;
+    while (stmt && sqlite3_step(stmt) == SQLITE_ROW) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, item, "id", (const char *)sqlite3_column_text(stmt, 0));
+        yyjson_mut_obj_add_strcpy(doc, item, "scope", (const char *)sqlite3_column_text(stmt, 1));
+        yyjson_mut_obj_add_strcpy(doc, item, "kind", (const char *)sqlite3_column_text(stmt, 2));
+        yyjson_mut_obj_add_strcpy(doc, item, "text", (const char *)sqlite3_column_text(stmt, 3));
+        yyjson_mut_obj_add_strcpy(doc, item, "source", (const char *)sqlite3_column_text(stmt, 4));
+        yyjson_mut_obj_add_strcpy(doc, item, "source_ref",
+                                  (const char *)sqlite3_column_text(stmt, 5));
+        yyjson_mut_obj_add_real(doc, item, "confidence", sqlite3_column_double(stmt, 6));
+        yyjson_mut_obj_add_real(doc, item, "importance", sqlite3_column_double(stmt, 7));
+        yyjson_mut_obj_add_strcpy(doc, item, "freshness",
+                                  (const char *)sqlite3_column_text(stmt, 8));
+        yyjson_mut_obj_add_int(doc, item, "committed_at", sqlite3_column_int64(stmt, 9));
+        yyjson_mut_arr_add_val(items, item);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    yyjson_mut_obj_add_int(doc, root, "count", count);
+    yyjson_mut_obj_add_val(doc, root, "items", items);
+    sqlite3_close(db);
+    return memory_result_doc(doc);
+}
+
+static char *handle_memory_audit(const char *tool_name, yyjson_val *args) {
+    const char *project_key = memory_arg_str(args, "project_key", "global");
+    sqlite3 *db = NULL;
+    if (memory_open_db(&db) != 0) {
+        return memory_error_result(tool_name, project_key, "failed to open memory manifest");
+    }
+    yyjson_mut_doc *doc = NULL;
+    yyjson_mut_val *root = memory_base_doc(&doc, tool_name, project_key);
+    yyjson_mut_obj_add_str(doc, root, "freshness", "fresh");
+    yyjson_mut_obj_add_int(doc, root, "pending", memory_count_by_status(db, project_key, "pending"));
+    yyjson_mut_obj_add_int(doc, root, "validated",
+                           memory_count_by_status(db, project_key, "validated"));
+    yyjson_mut_obj_add_int(doc, root, "committed_candidates",
+                           memory_count_by_status(db, project_key, "committed"));
+    yyjson_mut_obj_add_int(doc, root, "memories", memory_count_table(db, project_key, "memories"));
+    yyjson_mut_obj_add_bool(doc, root, "rebuild_required", false);
+    sqlite3_close(db);
+    return memory_result_doc(doc);
+}
+
+static char *handle_memory_rebuild(const char *tool_name, yyjson_val *args) {
+    const char *project_key = memory_arg_str(args, "project_key", "global");
+    yyjson_mut_doc *doc = NULL;
+    yyjson_mut_val *root = memory_base_doc(&doc, tool_name, project_key);
+    yyjson_mut_obj_add_str(doc, root, "status", "noop");
+    yyjson_mut_obj_add_int(doc, root, "rebuilt", 0);
+    yyjson_mut_obj_add_str(doc, root, "freshness", "fresh");
+    yyjson_mut_obj_add_str(doc, root, "next", "zvec adapter can rebuild derived recall indexes");
+    return memory_result_doc(doc);
+}
+
+static char *handle_memory_feedback(const char *tool_name, yyjson_val *args) {
+    const char *project_key = memory_arg_str(args, "project_key", "global");
+    const char *memory_id = memory_arg_str(args, "id", "");
+    const char *outcome = memory_arg_str(args, "outcome", "");
+    if (!memory_id[0] || !outcome[0]) {
+        return memory_error_result(tool_name, project_key, "memory_feedback requires id and outcome");
+    }
+    sqlite3 *db = NULL;
+    if (memory_open_db(&db) != 0) {
+        return memory_error_result(tool_name, project_key, "failed to open memory manifest");
+    }
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "INSERT INTO memory_feedback (memory_id,outcome,note,created_at) VALUES (?1,?2,?3,?4)";
+    int recorded = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, memory_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, outcome, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, memory_arg_str(args, "note", ""), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 4, (sqlite3_int64)time(NULL));
+        recorded = sqlite3_step(stmt) == SQLITE_DONE ? 1 : 0;
+    }
+    sqlite3_finalize(stmt);
+    yyjson_mut_doc *doc = NULL;
+    yyjson_mut_val *root = memory_base_doc(&doc, tool_name, project_key);
+    yyjson_mut_obj_add_str(doc, root, "status", recorded ? "recorded" : "error");
+    yyjson_mut_obj_add_int(doc, root, "recorded", recorded);
+    sqlite3_close(db);
+    return memory_result_doc(doc);
+}
+
+static char *handle_memory_tool(const char *tool_name, const char *args_json) {
+    yyjson_doc *args_doc = args_json ? yyjson_read(args_json, strlen(args_json), 0) : NULL;
+    yyjson_val *args_root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
+    char *result = NULL;
+    if (strcmp(tool_name, "memory_candidate") == 0) {
+        result = handle_memory_candidate(tool_name, args_root);
+    } else if (strcmp(tool_name, "memory_validate") == 0) {
+        result = handle_memory_validate(tool_name, args_root);
+    } else if (strcmp(tool_name, "memory_commit") == 0) {
+        result = handle_memory_commit(tool_name, args_root);
+    } else if (strcmp(tool_name, "memory_recall") == 0 || strcmp(tool_name, "memory_search") == 0) {
+        result = handle_memory_recall_search(tool_name, args_root);
+    } else if (strcmp(tool_name, "memory_audit") == 0) {
+        result = handle_memory_audit(tool_name, args_root);
+    } else if (strcmp(tool_name, "memory_rebuild") == 0) {
+        result = handle_memory_rebuild(tool_name, args_root);
+    } else if (strcmp(tool_name, "memory_feedback") == 0) {
+        result = handle_memory_feedback(tool_name, args_root);
+    } else {
+        result =
+            memory_error_result(tool_name, memory_arg_str(args_root, "project_key", "global"),
+                                "unknown memory tool");
+    }
+    if (args_doc) {
+        yyjson_doc_free(args_doc);
+    }
+    return result;
+}
+
+/* ── Tool dispatch ────────────────────────────────────────────── */
 
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
     if (!tool_name) {
@@ -4349,7 +4767,7 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
         return handle_ingest_traces(srv, args_json);
     }
     if (strncmp(tool_name, "memory_", strlen("memory_")) == 0) {
-        return handle_memory_stub(tool_name, args_json);
+        return handle_memory_tool(tool_name, args_json);
     }
     char msg[CBM_SZ_256];
     snprintf(msg, sizeof(msg), "unknown tool: %s", tool_name);

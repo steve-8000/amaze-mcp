@@ -304,7 +304,9 @@ static void print_help(void) {
     printf("\nTools: index_repository, search_graph, query_graph, trace_path,\n");
     printf("  get_code_snippet, get_graph_schema, get_architecture, search_code,\n");
     printf("  list_projects, delete_project, index_status, detect_changes,\n");
-    printf("  manage_adr, ingest_traces\n");
+    printf("  manage_adr, ingest_traces, memory_recall, memory_search,\n");
+    printf("  memory_candidate, memory_validate, memory_commit, memory_feedback,\n");
+    printf("  memory_rebuild, memory_audit\n");
 }
 
 /* ── Main ───────────────────────────────────────────────────────── */

@@ -368,25 +368,90 @@ TEST(server_handle_unknown_method) {
     PASS();
 }
 
-TEST(tool_memory_recall_stub) {
+TEST(tool_memory_lifecycle_sqlite_manifest) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-memory-mcp-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS(); /* skip if mkdtemp fails */
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
 
     char *resp = cbm_mcp_server_handle(
         srv,
         "{\"jsonrpc\":\"2.0\",\"id\":501,\"method\":\"tools/call\","
-        "\"params\":{\"name\":\"memory_recall\","
-        "\"arguments\":{\"project_key\":\"amaze\",\"query\":\"startup\"}}}");
+        "\"params\":{\"name\":\"memory_candidate\",\"arguments\":{"
+        "\"project_key\":\"test-memory-lifecycle\","
+        "\"scope\":\"project\",\"kind\":\"decision\","
+        "\"text\":\"Amaze agents must validate memory before commit.\","
+        "\"source\":\"test\",\"source_ref\":\"tests/test_mcp.c\","
+        "\"confidence\":0.9,\"importance\":0.8}}}");
 
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"id\":501"));
+    ASSERT_NOT_NULL(strstr(resp, "memory_candidate"));
+    ASSERT_NOT_NULL(strstr(resp, "sqlite-manifest"));
+    ASSERT_NOT_NULL(strstr(resp, "candidate_id"));
+    ASSERT_NOT_NULL(strstr(resp, "pending"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":502,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"memory_validate\",\"arguments\":{"
+        "\"project_key\":\"test-memory-lifecycle\",\"dry_run\":false}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":502"));
+    ASSERT_NOT_NULL(strstr(resp, "memory_validate"));
+    ASSERT_NOT_NULL(strstr(resp, "sqlite-manifest"));
+    ASSERT_NOT_NULL(strstr(resp, "validated"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":503,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"memory_commit\",\"arguments\":{"
+        "\"project_key\":\"test-memory-lifecycle\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":503"));
+    ASSERT_NOT_NULL(strstr(resp, "memory_commit"));
+    ASSERT_NOT_NULL(strstr(resp, "sqlite-manifest"));
+    ASSERT_NOT_NULL(strstr(resp, "committed"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":504,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"memory_recall\",\"arguments\":{"
+        "\"project_key\":\"test-memory-lifecycle\","
+        "\"query\":\"validate memory\",\"topk\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":504"));
     ASSERT_NOT_NULL(strstr(resp, "memory_recall"));
     ASSERT_NOT_NULL(strstr(resp, "backend"));
-    ASSERT_NOT_NULL(strstr(resp, "manifest-stub"));
+    ASSERT_NOT_NULL(strstr(resp, "sqlite-manifest"));
+    ASSERT_NOT_NULL(strstr(resp, "Amaze agents must validate memory before commit."));
     ASSERT_NOT_NULL(strstr(resp, "freshness"));
+    ASSERT_NULL(strstr(resp, "manifest-stub"));
 
     free(resp);
     cbm_mcp_server_free(srv);
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/_memory.db", cache);
+    cbm_unlink(db_path);
+    cbm_rmdir(cache);
     PASS();
 }
 
@@ -2120,7 +2185,7 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_unified_backend_issue256);
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
-    RUN_TEST(tool_memory_recall_stub);
+    RUN_TEST(tool_memory_lifecycle_sqlite_manifest);
 
     /* Idle store eviction */
     RUN_TEST(store_idle_eviction);

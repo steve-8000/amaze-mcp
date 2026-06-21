@@ -1,0 +1,32 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.steve-8000/amaze-mcp",
+  "title": "Amaze",
+  "description": "Amaze native codebase and freshness-aware agent memory for AI agents.",
+  "repository": {
+    "url": "https://github.com/steve-8000/amaze-mcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/steve-8000/amaze-mcp",
+  "version": "0.8.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "amaze",
+      "version": "0.8.1",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      }
+    },
+    {
+      "registryType": "pypi",
+      "identifier": "amaze",
+      "version": "0.8.1",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

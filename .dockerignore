@@ -1,0 +1,14 @@
+.git
+.worktrees
+build
+graph-ui/node_modules
+graph-ui/dist
+test-infrastructure
+third_party/zvec/.git
+third_party/zvec/build
+third_party/zvec/cmake-build-*
+third_party/zvec/python/**/__pycache__
+*.db
+*.db-shm
+*.db-wal
+.DS_Store

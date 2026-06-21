@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_FILE="${AMAZE_COMPOSE_FILE:-$ROOT/docker-compose.yml}"
+CONTAINER="${AMAZE_CONTAINER_NAME:-amaze-mcp}"
+
+if ! docker container inspect "$CONTAINER" >/dev/null 2>&1; then
+  docker compose -f "$COMPOSE_FILE" up -d --build >/dev/null
+elif [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER")" != "true" ]]; then
+  docker compose -f "$COMPOSE_FILE" up -d >/dev/null
+fi
+
+exec docker exec -i \
+  -e "AMAZE_CACHE_DIR=${AMAZE_CACHE_DIR:-/Users/steve/.cache/amaze-mcp}" \
+  -e "CBM_CACHE_DIR=${AMAZE_CACHE_DIR:-/Users/steve/.cache/amaze-mcp}" \
+  -e "CBM_LOG_LEVEL=${AMAZE_LOG_LEVEL:-info}" \
+  -e "CBM_WORKERS=${AMAZE_WORKERS:-4}" \
+  -e "HOME=${AMAZE_HOME:-/Users/steve}" \
+  -w "${AMAZE_WORKDIR:-$PWD}" \
+  "$CONTAINER" \
+  /usr/local/bin/amaze-mcp "$@"

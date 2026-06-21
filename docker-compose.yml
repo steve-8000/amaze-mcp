@@ -1,0 +1,34 @@
+services:
+  amaze-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        WITH_UI: "${AMAZE_WITH_UI:-true}"
+    image: amaze-mcp:local
+    container_name: "${AMAZE_CONTAINER_NAME:-amaze-mcp}"
+    user: "${AMAZE_UID:-501}:${AMAZE_GID:-20}"
+    environment:
+      AMAZE_CACHE_DIR: "${AMAZE_CACHE_DIR:-/Users/steve/.cache/amaze-mcp}"
+      CBM_CACHE_DIR: "${AMAZE_CACHE_DIR:-/Users/steve/.cache/amaze-mcp}"
+      CBM_LOG_LEVEL: "${AMAZE_LOG_LEVEL:-info}"
+      CBM_WORKERS: "${AMAZE_WORKERS:-4}"
+      HOME: "${AMAZE_HOME:-/Users/steve}"
+    volumes:
+      - "${AMAZE_HOST_HOME:-/Users/steve}:${AMAZE_HOME:-/Users/steve}"
+      - amaze-cache:${AMAZE_CACHE_DIR:-/Users/steve/.cache/amaze-mcp}
+    working_dir: "${AMAZE_HOME:-/Users/steve}"
+    ports:
+      - "127.0.0.1:${AMAZE_UI_PORT:-9749}:9749"
+    entrypoint: ["/bin/sh", "-lc"]
+    command:
+      - "socat TCP-LISTEN:9749,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:${AMAZE_UI_INTERNAL_PORT:-19749} & tail -f /dev/null | /usr/local/bin/amaze-mcp --ui=true --port=${AMAZE_UI_INTERNAL_PORT:-19749}"
+    restart: unless-stopped
+
+volumes:
+  amaze-cache:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: "${AMAZE_CACHE_HOST_PATH:-/Users/steve/.cache/amaze-mcp}"
